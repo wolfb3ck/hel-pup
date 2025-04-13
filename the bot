@@ -1,0 +1,410 @@
+import discord
+from discord.ext import commands, tasks
+from dotenv import load_dotenv
+import os
+import json
+import random
+import asyncio
+from collections import defaultdict, deque
+import requests
+import yt_dlp
+import nest_asyncio
+import aiohttp
+
+git remote add origin https://github.com/wolfb3ck/hel-pup.git
+git branch -M main
+git push -u origin main
+
+nest_asyncio.apply()
+
+# Load environment variables
+load_dotenv()
+TOKEN = os.getenv('DISCORD_TOKEN')
+LEVEL_CHANNEL_ID = int(os.getenv('LEVEL_CHANNEL_ID', 0))
+
+if TOKEN is None:
+    raise ValueError("No DISCORD_TOKEN found in environment variables. Please check your .env file")
+
+# YouTube DL configuration
+ytdl_format_options = {
+    'format': 'bestaudio/best',
+    'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
+    'restrictfilenames': True,
+    'noplaylist': True,
+    'nocheckcertificate': True,
+    'ignoreerrors': False,
+    'logtostderr': False,
+    'quiet': True,
+    'no_warnings': True,
+    'default_search': 'auto',
+    'source_address': '0.0.0.0'
+}
+
+ffmpeg_options = {
+    'options': '-vn'
+}
+
+ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
+
+class YTDLSource(discord.PCMVolumeTransformer):
+    def __init__(self, source, *, data, volume=0.5):
+        super().__init__(source, volume)
+        self.data = data
+        self.title = data.get('title')
+        self.url = data.get('url')
+
+    @classmethod
+    async def from_url(cls, url, *, loop=None, stream=False):
+        loop = loop or asyncio.get_event_loop()
+        try:
+            data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
+            
+            if 'entries' in data:
+                data = data['entries'][0]
+            
+            filename = data['url'] if stream else ytdl.prepare_filename(data)
+            return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
+        except Exception as e:
+            print(f"Error in from_url: {e}")
+            raise
+
+ffmpeg_options = {
+    'options': '-vn',
+    'executable': './ffmpeg/ffmpeg.exe'  # Points to local copy
+}
+
+
+# Bot setup
+intents = discord.Intents.default()
+intents.messages = True
+intents.message_content = True
+intents.voice_states = True
+
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+# Leveling system
+user_data = defaultdict(lambda: {'xp': 0, 'level': 0, 'messages': 0})
+
+def save_data():
+    with open('user_data.json', 'w') as f:
+        json.dump(dict(user_data), f)
+
+def load_data():
+    try:
+        with open('user_data.json', 'r') as f:
+            data = json.load(f)
+            for user_id, stats in data.items():
+                user_data[user_id] = stats
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+# Music queue
+music_queues = defaultdict(deque)
+current_song = {}
+
+def after_playing(error, ctx):
+    if error:
+        print(f'Player error: {error}')
+    asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
+
+async def play_next(ctx):
+    if not ctx.voice_client:
+        return
+        
+    if music_queues[ctx.guild.id]:
+        next_song = music_queues[ctx.guild.id].popleft()
+        current_song[ctx.guild.id] = next_song
+        ctx.voice_client.play(next_song, after=lambda e: after_playing(e, ctx))
+        await ctx.send(f"Now playing: {next_song.title}")
+    else:
+        current_song.pop(ctx.guild.id, None)
+        await ctx.send("Queue is empty! Add more songs with !play")
+
+@bot.event
+async def on_ready():
+    print(f'Logged in as {bot.user.name} ({bot.user.id})')
+    print('------')
+    load_data()
+    update_status.start()
+
+@tasks.loop(minutes=10)
+async def update_status():
+    await bot.change_presence(activity=discord.Game(name="with balls | !help"))
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+    
+    # Leveling system
+    user_id = str(message.author.id)
+    user_data[user_id]['messages'] += 1
+    user_data[user_id]['xp'] += random.randint(5, 15)
+    save_data()
+    
+    await check_level_up(user_id)
+    
+    # Puppy responses
+    content = message.content.lower()
+    if 'bark' in content:
+        await message.channel.send('Woof! Woof! 🐶')
+    elif 'ball' in content:
+        responses = [
+            "Woof! Where's the ball? I wanna play! 🎾",
+            "Ball?! I love balls! Throw it! Throw it! 🎾",
+            "Bark bark! *wags tail excitedly* 🐕"
+        ]
+        await message.channel.send(random.choice(responses))
+    elif 'good boy' in content or 'good girl' in content:
+        await message.channel.send("*wags tail happily* 😊")
+    elif 'treat' in content:
+        await message.channel.send("*perks up ears* Did someone say treat? 🦴")
+    
+    await bot.process_commands(message)
+
+def calculate_xp_for_level(level):
+    return 5 * (level ** 2) + 50 * level + 100
+
+async def check_level_up(user_id):
+    data = user_data[user_id]
+    xp_needed = calculate_xp_for_level(data['level'])
+    if data['xp'] >= xp_needed:
+        data['level'] += 1
+        data['xp'] = 0
+        save_data()
+        
+        user = bot.get_user(int(user_id))
+        if not user:
+            return False
+        
+        channel = bot.get_channel(LEVEL_CHANNEL_ID)
+        if channel:
+            await channel.send(f"🎉 {user.display_name} has leveled up to level {data['level']}! 🎉")
+        return True
+    return False
+
+# Leveling commands
+@bot.command(name='level', help='Check your current level and XP')
+async def level(ctx):
+    user_id = str(ctx.author.id)
+    data = user_data[user_id]
+    xp_needed = calculate_xp_for_level(data['level'])
+    
+    embed = discord.Embed(
+        title=f"{ctx.author.display_name}'s Level",
+        description=f"**Level:** {data['level']}\n**XP:** {data['xp']}/{xp_needed}\n**Messages:** {data['messages']}",
+        color=discord.Color.green()
+    )
+    if ctx.author.avatar:
+        embed.set_thumbnail(url=ctx.author.avatar.url)
+    await ctx.send(embed=embed)
+
+@bot.command(name='leaderboard', aliases=['lb'], help='Show the server leaderboard')
+async def leaderboard(ctx, top: int = 10):
+    # Convert user_data to a list of tuples and sort by level (descending)
+    sorted_users = sorted(
+        [(user_id, data) for user_id, data in user_data.items()],
+        key=lambda x: x[1]['level'],
+        reverse=True
+    )
+    
+    embed = discord.Embed(
+        title="🏆 Server Leaderboard 🏆",
+        color=discord.Color.gold()
+    )
+    
+    for i, (user_id, data) in enumerate(sorted_users[:top], 1):
+        try:
+            user = await bot.fetch_user(int(user_id))  # This works even if user isn't cached
+            embed.add_field(
+                name=f"{i}. {user.display_name}",
+                value=f"Level: {data['level']} | XP: {data['xp']}",
+                inline=False
+            )
+        except:
+            continue  # Skip if user not found
+    
+    if not embed.fields:  # If no users were added
+        embed.description = "No users found on the leaderboard!"
+    
+    await ctx.send(embed=embed)
+
+# Music commands
+@bot.command(name='join', help='Joins your voice channel')
+async def join(ctx):
+    if not ctx.author.voice:
+        await ctx.send("You're not in a voice channel!")
+        return
+    
+    channel = ctx.author.voice.channel
+    await channel.connect()
+    await ctx.send(f"Joined {channel.name}!")
+
+@bot.command(name='play', help='Plays a song from YouTube')
+async def play(ctx, *, url):
+    if not ctx.author.voice:
+        await ctx.send("You're not in a voice channel!")
+        return
+    
+    voice_client = ctx.voice_client or await ctx.author.voice.channel.connect()
+    
+    async with ctx.typing():
+        try:
+            player = await YTDLSource.from_url(url, loop=bot.loop, stream=True)
+            
+            if voice_client.is_playing():
+                music_queues[ctx.guild.id].append(player)
+                await ctx.send(f"Added to queue: {player.title}")
+            else:
+                current_song[ctx.guild.id] = player
+                voice_client.play(player, after=lambda e: after_playing(e, ctx))
+                await ctx.send(f"Now playing: {player.title}")
+        except Exception as e:
+            await ctx.send(f"Error playing song: {str(e)}")
+            print(f"Playback error: {e}")
+
+@bot.command(name='pause', help='Pauses the current song')
+async def pause(ctx):
+    voice_client = ctx.voice_client
+    if voice_client and voice_client.is_playing():
+        voice_client.pause()
+        await ctx.send("Paused ⏸️")
+    else:
+        await ctx.send("Nothing is playing!")
+
+@bot.command(name='resume', help='Resumes the current song')
+async def resume(ctx):
+    voice_client = ctx.voice_client
+    if voice_client and voice_client.is_paused():
+        voice_client.resume()
+        await ctx.send("Resumed ▶️")
+    else:
+        await ctx.send("The player is not paused!")
+
+@bot.command(name='stop', help='Stops the current song and clears the queue')
+async def stop(ctx):
+    voice_client = ctx.voice_client
+    if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
+        voice_client.stop()
+        music_queues[ctx.guild.id].clear()
+        await ctx.send("Stopped playback and cleared queue ⏹️")
+    else:
+        await ctx.send("Nothing is playing!")
+
+@bot.command(name='skip', help='Skips the current song')
+async def skip(ctx):
+    voice_client = ctx.voice_client
+    if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
+        voice_client.stop()
+        await ctx.send("Skipped ⏭️")
+        await play_next(ctx)
+    else:
+        await ctx.send("Nothing is playing!")
+
+@bot.command(name='queue', help='Shows the current queue')
+async def show_queue(ctx):
+    if ctx.guild.id in current_song:
+        queue_list = [f"Now Playing: {current_song[ctx.guild.id].title}"]
+        queue_list.extend([f"{i+1}. {song.title}" for i, song in enumerate(music_queues[ctx.guild.id])])
+        
+        embed = discord.Embed(
+            title="🎵 Current Queue 🎵",
+            description="\n".join(queue_list),
+            color=discord.Color.blue()
+        )
+        await ctx.send(embed=embed)
+    else:
+        await ctx.send("The queue is empty!")
+
+@bot.command(name='leave', help='Leaves the voice channel')
+async def leave(ctx):
+    voice_client = ctx.voice_client
+    if voice_client and voice_client.is_connected():
+        music_queues[ctx.guild.id].clear()
+        current_song.pop(ctx.guild.id, None)
+        await voice_client.disconnect()
+        await ctx.send("Left the voice channel 👋")
+    else:
+        await ctx.send("I'm not in a voice channel!")
+
+# Fun commands
+@bot.command(name='pet', help='Pet the puppy')
+async def pet(ctx):
+    responses = [
+        "*wags tail happily* 🐕",
+        "*rolls over for belly rubs* 🥰",
+        "*licks your hand* 😛",
+        "*nuzzles against you* 💕"
+    ]
+    await ctx.send(random.choice(responses))
+
+@bot.command(name='fetch', help='Play fetch with the puppy')
+async def fetch(ctx):
+    await ctx.send("*runs after the ball and brings it back* 🎾")
+
+@bot.command(name='trick', help='Ask the puppy to do a trick')
+async def trick(ctx):
+    tricks = [
+        "*sits* 🐶",
+        "*rolls over* 🔄",
+        "*gives paw* ✋",
+        "*plays dead* 💀",
+        "*spins in a circle* 🌀"
+    ]
+    await ctx.send(random.choice(tricks))
+
+@bot.command(name='dogfact', help='Get a random dog fact')
+async def dogfact(ctx):
+    api_endpoints = [
+        "https://dog-facts-api.herokuapp.com/api/v1/resources/dogs?number=1",
+        "https://some-random-api.ml/facts/dog",
+        "https://api.aakhilv.me/fun/facts?type=dog"
+    ]
+    
+    async with aiohttp.ClientSession() as session:
+        for endpoint in api_endpoints:
+            try:
+                async with session.get(endpoint, timeout=3) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        # Different APIs return data in different formats
+                        if "facts" in data:
+                            fact = data['facts'][0]
+                        elif "fact" in data:
+                            fact = data['fact']
+                        elif isinstance(data, list) and "fact" in data[0]:
+                            fact = data[0]['fact']
+                        else:
+                            continue
+                            
+                        await ctx.send(f"🐕 **Dog Fact:** {fact}")
+                        return
+            except:
+                continue
+    
+    # If all APIs fail, use a local fallback
+    local_facts = [
+        "Dogs' noses are wet to help absorb scent chemicals!",
+        "A dog's sense of smell is 40x better than humans!",
+        "The Basenji dog doesn't bark, it yodels!",
+        "Dogs dream like humans do!",
+        "A dog's nose print is unique, like a human fingerprint!"
+    ]
+    await ctx.send(f"🐕 **Dog Fact:** {random.choice(local_facts)}")
+    
+@bot.command(name='bark', help='Make the puppy bark')
+async def bark(ctx):
+    await ctx.send("Woof! Woof! 🐶")
+
+# Error handling
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        await ctx.send("Command not found. Try !help for a list of commands.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("Missing required argument. Check !help for command usage.")
+    else:
+        await ctx.send(f"An error occurred: {str(error)}")
+
+# Run the bot
+bot.run(TOKEN)
